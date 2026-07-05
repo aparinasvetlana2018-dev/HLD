@@ -3,7 +3,7 @@
 
 **Версия:** 1.0  
 **Дата:** 05.07.2026  
-**Статус:** MVP-ядро (без соцсети гостей, без раннего ухода, без финального чека)
+**Статус:** MVP-ядро
 
 ---
 
@@ -167,7 +167,7 @@
 - Управление слотами.
 - Бронирование, холд, статусы брони.
 - Санитарный перерыв, блокировка наложений.
-- Отмена (без возврата при раннем уходе).
+- Отмена.
 
 **Взаимодействия:**
 - API Gateway → Booking Service (создание, отмена, завершение).
@@ -426,3 +426,475 @@
 - Версия 1.0: базовая HLD для MVP.
 - Версия 1.1: без соцсети гостей, без раннего ухода, без финального чека, один чек.
 - Следующая версия: микросервисная архитектура, отдельный Search Service с индексом, детализированные API контракты.
+Архитектурные решения (Architecture Decisions)
+Платформа бронирования помещений
+Версия: 1.0
+Дата: 05.07.2026
+Статус: MVP-ядро
+
+1. Выбор SQL
+1.1 Рекомендация
+Для MVP использовать SQL, конкретно PostgreSQL.
+
+1.2 Почему SQL, а не NoSQL
+Основные причины для booking-системы:
+
+ACID-транзакции: брони и платежи требуют строгой целостности (нельзя допустить двойного бронирования одного слота). SQL даёт гарантии:
+
+Atomicity (единообразие транзакции),
+
+Consistency (согласованность),
+
+Isolation (параллельность без конфликтов),
+
+Durability (данные не пропадут).
+
+Фиксированная структура: данные пользователей, помещений, броней, платежей, чеков — чётко структурированы (поля, типы, связи). SQL идеально подходит для этого.
+
+Сложные запросы:
+
+фильтр по доступным слотам,
+
+aggregation по доходам владельцев,
+
+расчёт комиссий,
+
+выборка по времени и статусам.
+SQL позволяет делать это через joins, группировки, индексы.
+
+Средний масштаб: для старта и MVP объединённая база на PostgreSQL будет достаточной и дешевле в поддержке, чем NoSQL-кластер.
+
+1.3 Где NoSQL может быть полезен в будущем
+Кэш сессий, OTP, rate limits: Redis (in-memory) — это уже по плану.
+
+Сессии, кеши поиска, история событий: можно добавить NoSQL (например, Cassandra) для истории событий, но это не для MVP.
+
+Итог: Пока только PostgreSQL + Redis.
+
+2. Детальная схема БД (структура таблиц)
+2.1 Основные таблицы
+2.1.1 users
+Пользователи (клиенты и владельцы).
+
+Поле	Тип	Описание
+id	UUID	Primary key
+email	VARCHAR(255)	Уникальный email
+phone	VARCHAR(50)	Уникальный телефон
+password_hash	VARCHAR(255)	Хеш пароля
+fio	VARCHAR(255)	ФИО
+gender	VARCHAR(20)	Опционально
+birth_date	DATE	Опционально
+activity_type	VARCHAR(255)	Род деятельности (для рекомендаций)
+notification_preferences	JSONB	Настройки уведомлений (push/email/SMS)
+roles	VARCHAR(255)	Компактный список ролей (user, owner, admin)
+status	VARCHAR(50)	active, blocked, deleted
+created_at	TIMESTAMP	Дата создания
+updated_at	TIMESTAMP	Дата обновления
+Индексы: email, phone.
+
+2.1.2 otp_codes
+Коды подтверждения (OTP).
+
+Поле	Тип	Описание
+id	UUID	Primary key
+user_id	UUID	FK → users.id
+type	VARCHAR(20)	registration, login, reset_password
+code	VARCHAR(20)	Код
+expires_at	TIMESTAMP	Время жизни
+confirmed	BOOLEAN	Признак использования
+created_at	TIMESTAMP	Дата создания
+Индексы: user_id, expires_at, confirmed.
+
+2.1.3 sessions
+Сессии пользователей (если нужны).
+
+Поле	Тип	Описание
+id	UUID	Primary key
+user_id	UUID	FK → users.id
+token	VARCHAR(255)	JWT или токен сессии
+expires_at	TIMESTAMP	Время жизни
+revoked	BOOLEAN	Признак отмены
+created_at	TIMESTAMP	Дата создания
+Индексы: user_id, token, expires_at.
+
+2.1.4 properties
+Помещения.
+
+Поле	Тип	Описание
+id	UUID	Primary key
+owner_id	UUID	FK → users.id
+description	TEXT	Описание
+type	VARCHAR(50)	Тип помещения (офис, шоурум и т.п.)
+conveniences	JSONB	Список удобств (checkboxes)
+places_count	INT	Количество посадочных мест
+price	NUMERIC(10,2)	Цена за час/блок
+time_room	JSONB	Время работы помещения (по дням)
+time_building	JSONB	Время работы здания (если отличается)
+notes	TEXT	Примечания (нерабочие часы, особые условия)
+promo_code_id	VARCHAR(50)	Код промо (ПРОМО1/ПРОМО2)
+moderation_status	VARCHAR(50)	draft, on_moderation, approved, rejected, hidden_bank_pending
+moderation_reason	TEXT	Причина отклонения
+status	VARCHAR(50)	active, archived, deleted
+created_at	TIMESTAMP	Дата создания
+updated_at	TIMESTAMP	Дата обновления
+Индексы: owner_id, moderation_status, status.
+
+2.1.5 property_photos
+Фото помещений.
+
+Поле	Тип	Описание
+id	UUID	Primary key
+property_id	UUID	FK → properties.id
+url	VARCHAR(500)	URL фото
+type	VARCHAR(50)	room, entrance, other
+created_at	TIMESTAMP	Дата создания
+Индексы: property_id.
+
+2.1.6 payout_accounts
+Реквизиты выплат владельцев.
+
+Поле	Тип	Описание
+id	UUID	Primary key
+user_id	UUID	FK → users.id
+inn	VARCHAR(20)	ИНН
+bik	VARCHAR(10)	БИК
+account_number	VARCHAR(50)	Номер счёта
+status	VARCHAR(50)	pending, verified, rejected
+verification_note	TEXT	Примечание модератора
+created_at	TIMESTAMP	Дата создания
+updated_at	TIMESTAMP	Дата обновления
+Индексы: user_id, status.
+
+2.1.7 bookings
+Бронирование.
+
+Поле	Тип	Описание
+id	UUID	Primary key
+property_id	UUID	FK → properties.id
+user_id	UUID	FK → users.id
+start_time	TIMESTAMP	Начало аренды
+end_time	TIMESTAMP	Конец аренды
+status	VARCHAR(50)	draft, hold, paid, active, completed, cancelled, expired, overstay
+hold_until	TIMESTAMP	Время, до которого заморожен слот
+promo_code_id	VARCHAR(50)	Использованный промокод
+canceled_reason	TEXT	Причина отмены
+created_at	TIMESTAMP	Дата создания
+updated_at	TIMESTAMP	Дата обновления
+Индексы: property_id, user_id, status, (start_time, end_time).
+
+2.1.8 slots
+Слоты (доступные/заблокированные интервалы).
+
+Поле	Тип	Описание
+id	UUID	Primary key
+property_id	UUID	FK → properties.id
+start_time	TIMESTAMP	Начало интервала
+end_time	TIMESTAMP	Конец интервала
+status	VARCHAR(50)	free, blocked
+booking_id	UUID	FK → bookings.id (опционально)
+created_at	TIMESTAMP	Дата создания
+Индексы: property_id, (start_time, end_time).
+
+2.1.9 payments
+Платежи.
+
+Поле	Тип	Описание
+id	UUID	Primary key
+booking_id	UUID	FK → bookings.id
+amount	NUMERIC(10,2)	Сумма
+currency	VARCHAR(3)	RUB
+status	VARCHAR(50)	pending, hold, paid, failed, refunded
+hold_until	TIMESTAMP	Время холда
+yookassa_payment_id	VARCHAR(255)	ID платежа в ЮKassa
+created_at	TIMESTAMP	Дата создания
+updated_at	TIMESTAMP	Дата обновления
+Индексы: booking_id, yookassa_payment_id, status.
+
+2.1.10 refunds
+Возвраты.
+
+Поле	Тип	Описание
+id	UUID	Primary key
+payment_id	UUID	FK → payments.id
+amount	NUMERIC(10,2)	Сумма возврата
+reason	TEXT	Причина
+status	VARCHAR(50)	pending, processed, failed
+yookassa_refund_id	VARCHAR(255)	ID возврата в ЮKassa
+created_at	TIMESTAMP	Дата создания
+updated_at	TIMESTAMP	Дата обновления
+Индексы: payment_id, status.
+
+2.1.11 receipts
+Чеки (один чек, без финального).
+
+Поле	Тип	Описание
+id	UUID	Primary key
+booking_id	UUID	FK → bookings.id
+user_id	UUID	FK → users.id
+property_id	UUID	FK → properties.id
+amount	NUMERIC(10,2)	Сумма
+type	VARCHAR(50)	prepayment
+platform_info	JSONB	Данные платформы
+yookassa_payment_id	VARCHAR(255)	ID платежа для чека
+issued_at	TIMESTAMP	Дата выдачи
+Индексы: booking_id, user_id.
+
+2.1.12 commissions
+Комиссии и удержания.
+
+Поле	Тип	Описание
+id	UUID	Primary key
+booking_id	UUID	FK → bookings.id
+amount	NUMERIC(10,2)	Сумма транзакции
+commission_amount	NUMERIC(10,2)	Комиссия платформы
+promo_discount	NUMERIC(10,2)	Скидка от промокода
+owner_payout	NUMERIC(10,2)	Что идёт владельцу
+created_at	TIMESTAMP	Дата создания
+Индексы: booking_id.
+
+2.1.13 access_codes
+Коды доступа.
+
+Поле	Тип	Описание
+id	UUID	Primary key
+booking_id	UUID	FK → bookings.id
+user_code	VARCHAR(50)	Одноразовый код пользователя
+owner_code	VARCHAR(50)	Постоянный код владельца
+valid_from	TIMESTAMP	Начало действия
+valid_until	TIMESTAMP	Конец действия
+used_at	TIMESTAMP	Время использования
+revoked	BOOLEAN	Признак отмены
+created_at	TIMESTAMP	Дата создания
+Индексы: booking_id, user_code, (valid_from, valid_until).
+
+2.1.14 notifications
+Уведомления.
+
+Поле	Тип	Описание
+id	UUID	Primary key
+user_id	UUID	FK → users.id
+type	VARCHAR(50)	registration, booking_created, payment_success, access_code, cancellation, completion
+channel	VARCHAR(50)	push, email, sms
+payload	JSONB	Данные уведомления
+status	VARCHAR(50)	pending, sent, failed
+sent_at	TIMESTAMP	Время отправки
+created_at	TIMESTAMP	Дата создания
+Индексы: user_id, type, status.
+
+2.1.15 incidents
+Обращения/инциденты.
+
+Поле	Тип	Описание
+id	UUID	Primary key
+type	VARCHAR(50)	payment_issue, booking_issue, access_issue, moderation_issue
+related_booking_id	UUID	FK → bookings.id (опционально)
+related_payment_id	UUID	FK → payments.id (опционально)
+description	TEXT	Описание
+status	VARCHAR(50)	open, in_progress, resolved, closed
+handler_id	UUID	FK → users.id (админ)
+created_at	TIMESTAMP	Дата создания
+updated_at	TIMESTAMP	Дата обновления
+Индексы: type, status, related_booking_id, related_payment_id.
+
+2.2 Связи
+users → properties (owner_id)
+
+users → payout_accounts (user_id)
+
+users → bookings (user_id)
+
+properties → bookings (property_id)
+
+bookings → payments (booking_id)
+
+payments → refunds (payment_id)
+
+bookings → receipts (booking_id)
+
+bookings → commissions (booking_id)
+
+bookings → access_codes (booking_id)
+
+users → notifications (user_id)
+
+users → incidents (handler_id)
+
+3. Детальная спецификация API (endpoints)
+Используем REST, JSON. Все запросы через API Gateway.
+
+3.1 Auth
+POST /auth/register — регистрация (email/phone, password).
+
+POST /auth/verify-otp — подтверждение OTP (user_id, otp_code).
+
+POST /auth/login — вход (email/phone, password) → JWT.
+
+POST /auth/reset-password — запрос сброса пароля (email).
+
+POST /auth/confirm-reset-password — подтверждение сброса (reset_token, new_password).
+
+3.2 Profile (User)
+GET /users/profile — получение профиля.
+
+PUT /users/profile — обновление профиля (fio, activity_type, notification_preferences).
+
+3.3 Properties
+POST /properties — создание помещения.
+
+GET /properties/{id} — получение карточки помещения.
+
+PUT /properties/{id} — редактирование помещения.
+
+POST /properties/{id}/photos — добавление фото.
+
+DELETE /properties/{id}/photos/{photo_id} — удаление фото.
+
+3.4 Admin (Moderation)
+GET /admin/properties?status=on_moderation — список помещений на модерации.
+
+PUT /admin/properties/{id}/moderation — модерация (status, reason).
+
+PUT /admin/payout_accounts/{id}/verify — подтверждение реквизитов.
+
+3.5 Search & Catalog
+GET /search — поиск (type, conveniences, price_min, price_max, start_time, end_time).
+
+GET /search/hot — горячие предложения.
+
+3.6 Bookings
+POST /bookings — создание брони (property_id, start_time, end_time, promo_code).
+
+GET /bookings/{id} — просмотр брони.
+
+PUT /bookings/{id}/cancel — отмена брони.
+
+PUT /bookings/{id}/complete — завершение аренды.
+
+3.7 Payments
+POST /bookings/{id}/payment/start — начало оплаты (возврат yookassa_payment_id).
+
+POST /bookings/{id}/payment/confirm — подтверждение оплаты (yookassa_callback).
+
+3.8 Access
+GET /bookings/{id}/access-code — получение кода доступа.
+
+3.9 Notifications
+POST /notifications/profile — обновление настроек уведомлений.
+
+3.10 Incidents
+POST /incidents — создание обращения (type, related_booking_id, related_payment_id, description).
+
+GET /admin/incidents — список обращений админа.
+
+PUT /admin/incidents/{id} — обновление статуса обращения.
+
+4. Точная схема интеграции с системой двери
+4.1 Модель взаимодействия
+Backend → Door System API (HTTP/HTTPS).
+
+Door System API → Backend (webhook, если нужно).
+
+4.2 API двери (пример)
+POST /door/validate-code
+
+Body: { code: string, property_id: string }
+
+Ответ: { valid: boolean, user_id: string, booking_id: string }
+
+POST /door/grant-access
+
+Body: { code: string, property_id: string, valid_from: timestamp, valid_until: timestamp }
+
+Ответ: { success: boolean }
+
+4.3 Алгоритм выдачи и проверки кода
+После перехода брони в статус paid:
+
+Access Service → DB (запись access_codes).
+
+Access Service → Door API (grant-access с valid_from/end).
+
+Access Service → Notification Service (push/email с кодом).
+
+При попытке войти:
+
+Door API → Access Service (validate-code).
+
+Access Service проверяет:
+
+код существует,
+
+не revoked,
+
+within (valid_from, valid_until),
+
+привязан к активной бронь.
+
+Door API открывает/не открывает дверь.
+
+После завершения аренды:
+
+Booking Service → Access Service (сигнал завершения).
+
+Access Service → Door API (реvoke кода).
+
+5. Стратегия масштабирования
+5.1 MVP-этап
+Один сервер (backend + DB + Redis).
+
+Redis:
+
+сессии,
+
+OTP,
+
+rate limits.
+
+PostgreSQL:
+
+транзакции для броней и платежей,
+
+индексы по ключевым полям.
+
+5.2 Увеличение нагрузки
+Если нагрузка резко вырастет:
+
+Отделение DB:
+
+Backend → отдельный PostgreSQL.
+
+Добавить read-replica для поиска и каталога.
+
+Кеширование:
+
+Добавить Redis для:
+
+результатов поиска,
+
+rate limit counters,
+
+сессий и OTP.
+
+Микросервисы:
+
+Разделить:
+
+Search Service (с Elasticsearch/Meilisearch),
+
+Booking Service,
+
+Payment Service.
+
+Асинхронная коммуникация:
+
+Добавить Message Queue (Kafka/RabbitMQ) для:
+
+уведомлений,
+
+событий (booking_created, payment_success, etc.).
+
+Rate limiting и защита:
+
+API Gateway с rate limits по user_id / IP.
+
+Idempotency keys для броней (unique booking request id).
