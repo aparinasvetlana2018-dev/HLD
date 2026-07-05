@@ -1,0 +1,428 @@
+# High-Level Design (HLD)
+## Платформа бронирования помещений
+
+**Версия:** 1.0  
+**Дата:** 05.07.2026  
+**Статус:** MVP-ядро (без соцсети гостей, без раннего ухода, без финального чека)
+
+---
+
+## 1. Введение
+
+### 1.1 Назначение документа
+Документ описывает архитектуру платформы бронирования помещений: модули, сервисы, интеграции, основные потоки данных, границы ответственностей, где хранятся данные и кто с чем взаимодействует. Он нужен, чтобы:
+- ИИ и разработчики не плодили несовместимые решения;
+- быстро объяснять новую команду и подрядчиков, как система устроена;
+- фиксировать нефункциональные требования (NFR) и ключевые архитектурные решения.
+
+### 1.2 Область системы
+Система MVP включает:
+- Регистрация, вход, восстановление пароля.
+- Профиль пользователя (без публичности гостей и соцсети).
+- Создание и модерация помещений.
+- Поиск и каталог помещений.
+- Бронирование, холд слота, оплата, код двери.
+- Отмена и возврат (только по полным отменам, без возврата при раннем уходе).
+- Один чек (предоплата), без финального расчёта и финального чека.
+- Администрирование и ручное решение инцидентов.
+
+Внешние системы:
+- ЮKassa (платёжный шлюз, webhooks, чеки).
+- Система уведомлений (push, email, SMS, если есть).
+- Подсистема двери (API для выдачи и проверки кодов).
+
+---
+
+## 2. Общий вид архитектуры
+
+### 2.1 Стиль архитектуры
+- Единый монолитный backend с REST API.
+- Клиентские приложения: веб и мобильное приложение.
+- API Gateway / слой маршрутизации и аутентификации.
+- Один primary-база данных (SQL или NoSQL) + cache (Redis).
+- Внешние интеграции через отдельный слой интеграции (external adapters).
+
+Модули внутри backend:
+- Auth Service (регистрация, вход, сброс пароля).
+- User Service (профиль, настройки).
+- Property Service (помещения, модерация, счёта выплат).
+- Search & Catalog Service (каталог, фильтры, сортировка).
+- Booking Service (слоты, бронирование, холд, статусы).
+- Payment Service (холд, оплата, возвраты, интеграция с ЮKassa).
+- Access Service (выдача кодов двери, проверка кодов).
+- Notification Service (push, email, SMS).
+- Admin Service (модерация, инциденты, туры).
+- Billing & Receipt Service (чеки, учёт комиссии и промокодов).
+
+### 2.2 Основные компоненты
+
+```text
+[Web/Mobile Client]
+        ↓ HTTP/HTTPS
+   [API Gateway / Auth Layer]
+        ↓
+   [Backend Application]
+   ├─ Auth Service
+   ├─ User Service
+   ├─ Property Service
+   ├─ Search & Catalog Service
+   ├─ Booking Service
+   ├─ Payment Service
+   ├─ Access Service
+   ├─ Notification Service
+   ├─ Admin Service
+   └─ Billing & Receipt Service
+        ↓ DB calls
+   [Primary Database]
+   [Cache (Redis)]
+        ↓ HTTP/HTTPS / Webhooks
+   [ЮKassa]
+   [Notification Provider]
+   [Door Access System]
+```
+
+---
+
+## 3. Модули и сервисы
+
+### 3.1 Auth Service
+
+**Назначение:**
+- Регистрация пользователей (email/телефон).
+- Подтверждение контакта (OTP).
+- Вход (JWT).
+- Сброс пароля.
+
+**Взаимодействия:**
+- API Gateway → Auth Service (регистрация, вход, сброс).
+- Auth Service → Primary DB (хранение пользователей, токенов).
+- Auth Service → Notification Service (OTP, письмо сброса).
+
+**Данные:**
+- Пользователи (id, email, phone, password_hash, roles, status).
+- OTP-коды (id, user_id, type, code, expires_at, confirmed).
+- JWT-токены (id, user_id, expires_at, revoked).
+
+---
+
+### 3.2 User Service
+
+**Назначение:**
+- Хранение и управление профилем пользователя, без публичности гостей и соцсети.
+- Род деятельности, настройка уведомлений.
+
+**Взаимодействия:**
+- Auth Service ↔ User Service (создание профиля после регистрации).
+- API Gateway → User Service (получение/обновление профиля).
+- User Service → Primary DB.
+
+**Данные:**
+- Пользователь (id, fio, gender, birth_date, phone, email, activity_type, notification_preferences).
+
+---
+
+### 3.3 Property Service
+
+**Назначение:**
+- Создание и редактирование помещений.
+- Модерация (админ).
+- Управление реквизитами выплат (ИНН, БИК, счёт).
+
+**Взаимодействия:**
+- API Gateway → Property Service (создание, редактирование).
+- Property Service → Primary DB (помещения, фото, реквизиты).
+- Property Service → Admin Service (статус модерации).
+- Property Service → Search & Catalog Service (актуализация карточек).
+
+**Данные:**
+- Помещение (id, owner_id, description, type, conveniences, places_count, price, time_room, time_building, notes, promo_code_id).
+- Фото (id, property_id, url, type).
+- Реквизиты выплат (id, owner_id, inn, bik, account_number, status).
+- Модерация (property_id, status, reason, moderator_id, created_at, updated_at).
+
+---
+
+### 3.4 Search & Catalog Service
+
+**Назначение:**
+- Поиск помещений по критериям.
+- Фильтры, сортировка.
+- Горячие предложения.
+
+**Взаимодействия:**
+- API Gateway → Search Service (запросы поиска).
+- Search Service ↔ Property Service (получение данных помещений).
+- Search Service ↔ Primary DB (или optional search index).
+- Search Service ↔ Booking Service (проверка доступности слотов).
+
+**Данные:**
+- Индекс/каталог (property_id, basic fields, rating, convenience flags).
+- Фильтры (facility filters, price range, time range).
+
+---
+
+### 3.5 Booking Service
+
+**Назначение:**
+- Управление слотами.
+- Бронирование, холд, статусы брони.
+- Санитарный перерыв, блокировка наложений.
+- Отмена (без возврата при раннем уходе).
+
+**Взаимодействия:**
+- API Gateway → Booking Service (создание, отмена, завершение).
+- Booking Service ↔ Primary DB (бронирование, слоты).
+- Booking Service ↔ Search Service (проверка доступности).
+- Booking Service ↔ Payment Service (холд, оплата).
+- Booking Service ↔ Access Service (связь брони с кодом двери).
+- Booking Service ↔ Notification Service (события брони).
+
+**Данные:**
+- Бронь (id, property_id, user_id, start_time, end_time, status, hold_until, promo_code_id).
+- Слоты (property_id, free intervals, blocked intervals).
+- История изменений (booking_id, old_status, new_status, reason, actor_id, created_at).
+
+---
+
+### 3.6 Payment Service
+
+**Назначение:**
+- Холд на 15 минут.
+- Оплата (УКасса).
+- Возвраты только при полной отмене брони.
+- Интеграция с ЮKassa (webhooks).
+
+**Взаимодействия:**
+- API Gateway → Payment Service (начало оплаты, подтверждение).
+- Payment Service ↔ Booking Service (холд, статус брони).
+- Payment Service ↔ ЮKassa API (создание платежа, webhook).
+- Payment Service ↔ Billing & Receipt Service (чеки, расчёт комиссий).
+- Payment Service ↔ Notification Service (уведомления об оплате).
+
+**Данные:**
+- Платёж (id, booking_id, amount, currency, status, hold_until, yookassa_payment_id).
+- Возврат (id, payment_id, amount, reason, status).
+- История транзакций (booking_id, events, amounts, commission, payouts).
+
+---
+
+### 3.7 Access Service
+
+**Назначение:**
+- Выдача одноразовых кодов для пользователя.
+- Выдача постоянного кода для владельца.
+- Проверка кодов по API двери.
+
+**Взаимодействия:**
+- API Gateway → Access Service (выдача кода).
+- Access Service ↔ Booking Service (связь с активной бронью).
+- Access Service ↔ Door System API (валидация кода).
+- Access Service ↔ Notification Service (выдача кода).
+
+**Данные:**
+- Код доступа (id, booking_id, user_code, owner_code, valid_from, valid_until, used_at, revoked).
+
+---
+
+### 3.8 Notification Service
+
+**Назначение:**
+- Управление push, email, SMS.
+- Уведомления регистрации, брони, оплаты, кода, отмены, завершения.
+
+**Взаимодействия:**
+- Все сервисы → Notification Service (события).
+- Notification Service ↔ Notification Provider (email, SMS, push).
+- Notification Service ↔ Primary DB (история уведомлений).
+
+**Данные:**
+- Уведомление (id, user_id, type, channel, payload, status, sent_at).
+
+---
+
+### 3.9 Admin Service
+
+**Назначение:**
+- Модерация помещений.
+- Проверка реквизитов.
+- Ручное исправление статусов.
+- Инциденты и обращения.
+
+**Взаимодействия:**
+- API Gateway → Admin Service (админ-операции).
+- Admin Service ↔ Property Service (модерация).
+- Admin Service ↔ Payment Service (спорные платежи, возвраты).
+- Admin Service ↔ Booking Service (исправление статусов).
+- Admin Service ↔ Primary DB (обращения).
+
+**Данные:**
+- Обращение/инцидент (id, type, related_booking_id, related_payment_id, description, status, handler_id, created_at, updated_at).
+
+---
+
+### 3.10 Billing & Receipt Service
+
+**Назначение:**
+- Формирование одного чека (предоплата / предоплата + платёж).
+- Расчёт комиссий и удержаний.
+- Учёт промокодов.
+
+**Взаимодействия:**
+- Payment Service ↔ Billing Service (события платежей).
+- Billing Service ↔ Primary DB (чеки, расчёты).
+- Billing Service ↔ ЮKassa API (если чеки формируются через ЮKassa).
+
+**Данные:**
+- Чек (id, booking_id, user_id, property_id, amount, type, platform_info, issued_at).
+- Комиссия (booking_id, amount, commission_amount, promo_discount).
+
+---
+
+## 4. Внешние интеграции
+
+### 4.1 ЮKassa
+
+**Назначение:**
+- Оплата через СБП и карты.
+- Холд (авторизация) и подтверждение (capture).
+- Возвраты только при полной отмене.
+- Чеки (если требуется по 54-ФЗ).
+
+**Взаимодействия:**
+- Payment Service ↔ ЮKassa API (создание платежа, подтверждение, возвраты).
+- ЮKassa → Payment Service (webhook события).
+
+**Данные:**
+- Платёж (yookassa_payment_id, status, amount, currency).
+- Webhook события (event, payment_id, timestamp).
+
+### 4.2 Система уведомлений
+
+**Назначение:**
+- Push, email, SMS.
+
+**Взаимодействия:**
+- Notification Service ↔ Notification Provider API.
+
+### 4.3 Система двери
+
+**Назначение:**
+- Проверка кода доступа.
+- Разблокировка двери.
+
+**Взаимодействия:**
+- Access Service ↔ Door System API (валидация кода, выдача).
+
+---
+
+## 5. Данные и хранение
+
+### 5.1 Primary Database
+
+**Что хранится:**
+- Пользователи, профили.
+- Помещения, фото, реквизиты.
+- Бронирование, слоты.
+- Платежи, возвраты, чеки.
+- Обращения, инциденты.
+- История уведомлений.
+
+**Требования:**
+- Аудит изменений (логи статусов).
+- Поддержка транзакций (для платежа и брони).
+- Индексы по ключевым полям (user_id, property_id, booking_id).
+
+### 5.2 Cache (Redis)
+
+**Что хранится:**
+- OTP-коды.
+- JWT-токены (опционально).
+- Сессии.
+- Кратковременные данные (например, блоки по слотам во время холда).
+
+**Требования:**
+- TTL для OTP, сессий.
+- Быстрый доступ для частых операций.
+
+---
+
+## 6. Основные потоки данных
+
+### 6.1 Регистрация и вход
+
+1. Client → API Gateway (регистрация).
+2. API Gateway → Auth Service (создание пользователя).
+3. Auth Service ← Notification Service (OTP).
+4. Client → API Gateway (подтверждение OTP).
+5. API Gateway → Auth Service (подтверждение).
+6. Auth Service → Client (JWT).
+
+### 6.2 Бронирование и оплата
+
+1. Client → API Gateway (запрос бронирования).
+2. API Gateway → Booking Service (создание брони, холд).
+3. Booking Service ↔ Primary DB (занятие слота).
+4. Booking Service → Payment Service (начало оплаты).
+5. Payment Service ↔ ЮKassa (создание платежа).
+6. ЮKassa → Payment Service (вебхук).
+7. Payment Service → Booking Service (подтверждение оплаты).
+8. Booking Service ↔ Access Service (выдача кода).
+9. Notification Service → Client (push/email о успешной брони и коде).
+10. Billing Service → Primary DB (чек, расчёт комиссии).
+
+### 6.3 Завершение и возвраты
+
+1. Client → API Gateway (завершение аренды).
+2. API Gateway → Booking Service (смена статуса).
+3. Booking Service → Payment Service (сигнал о закрытии брони).
+4. Payment Service ↔ ЮKassa (возвраты, если бронь отменена полностью).
+5. Billing Service ↔ Admin Service (если требуется ручное решение).
+6. Notification Service → Client и Owner (уведомления о завершении/возврате).
+
+---
+
+## 7. Нефункциональные требования (NFR)
+
+| NFR | Описание |
+|---|---|
+| NFR-001 | Защита персональных данных и платёжных операций. |
+| NFR-002 | Пароли хранятся в хеше. |
+| NFR-003 | Журналирование критичных событий (логи изменений). |
+| NFR-004 | Защита от повторных запросов и двойных операций. |
+| NFR-005 | Обработка webhooks от ЮKassa. |
+| NFR-006 | Стабильность при одновременной работе с нескольких устройств. |
+| NFR-007 | Модерация помещений в течение 1 часа. |
+| NFR-008 | Адаптация под мобильные устройства. |
+
+---
+
+## 8. Развёртывание и инфраструктура
+
+### 8.1 Развёртывание
+- Development, Testing, Production окружения.
+- Incapsulation: API Gateway + Backend + DB + Cache.
+- Мониторинг и алертинг (логи, метрики, ошибки).
+
+### 8.2 Политика безопасности
+- HTTPS для всех внешних вызовов.
+- JWT-токены для авторизации.
+- Ограничение доступа к админ-зоне.
+- Валидация входных данных.
+
+---
+
+## 9. Открытые вопросы
+
+- Выбор SQL/NoSQL (какой тип БД использовать).
+- Детальная схема БД (структура таблиц).
+- Детальная спецификация API (конкретные endpoints).
+- Точная схема интеграции с системой двери.
+- Стратегия масштабирования (если нагрузка резко вырастет).
+
+---
+
+## 10. Версионирование
+
+- Версия 1.0: базовая HLD для MVP.
+- Версия 1.1: без соцсети гостей, без раннего ухода, без финального чека, один чек.
+- Следующая версия: микросервисная архитектура, отдельный Search Service с индексом, детализированные API контракты.
